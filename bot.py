@@ -11,6 +11,13 @@ Working tab layout (1-based columns):
 
 Phase 5 adds: multi-user "Recorded By" column, /start & /help, unauthorized
 access alerts, /restock, daily expiry alerts, and a weekly summary report.
+
+Phase 6 turns the "restocks" tab into a batch ledger: one row per delivery,
+each with its own expiry date. Formulas on that tab run a FIFO waterfall to
+work out how much of each batch is left, and the main tab derives stock levels
+and the next relevant expiry date from it. The bot therefore only ever appends
+batch rows (/restock) or writes to the Written Off column (/discard) — it never
+writes stock totals or expiry dates to the main tab.
 """
 
 import os
@@ -53,14 +60,15 @@ RESTOCK_SELECT = 10
 RESTOCK_AMOUNT = 11
 RESTOCK_EXPIRY = 12
 RESTOCK_ANOTHER = 13
+DISCARD_SELECT = 20
+DISCARD_AMOUNT = 21
 
-# Set of authorised Telegram user IDs, populated in main() from AUTHORIZED_USERS.
-# None means "no restriction configured" -> allow all users.
-AUTHORIZED_USERS = None
-
-# Chat ID for admin alerts (unauthorized access, expiry, weekly summary).
-# None means alerting is disabled (ADMIN_CHAT_ID unset in .env).
-ADMIN_CHAT_ID = None
+# Telegram user IDs per tier, populated in main() from AUTHORIZED_USERS and
+# EXCO_USERS. Both fail closed: an empty set grants nothing, so a missing or
+# misspelt .env entry can never hand out access. EXCO membership implies base
+# access, so allowed = AUTHORIZED_USERS | EXCO_USERS.
+AUTHORIZED_USERS = frozenset()
+EXCO_USERS = frozenset()
 
 # In-memory rate-limit tracker for unauthorized-access alerts: user_id -> last
 # alert datetime. Not persisted; resets on restart, which is fine.
@@ -74,25 +82,41 @@ STATUS_EMOJI = {
     "EXPIRED": "⚠️",
 }
 
-HELP_TEXT = (
+# Staff enter expiry dates day-first. Both separators are accepted so nobody is
+# rejected for typing the "wrong" one; the value is written to the sheet as ISO
+# regardless, so Google Sheets parses it the same way in any locale.
+EXPIRY_INPUT_FORMATS = ("%d-%m-%Y", "%d/%m/%Y")
+EXPIRY_FORMAT_HINT = "📅 Format: DD-MM-YYYY (e.g. 15-09-2026)"
+
+# Built from shared pieces rather than two full literals so the common commands
+# can't drift apart when one menu is edited.
+_HELP_TOP = (
     "☕ Welcome to the Cafe Logistics Bot!\n\n"
     "I help track ingredient inventory for each shift. Here's what I can do:\n\n"
     "📋 /recordpresale — Record ingredient weights at the start of a shift\n"
     "📋 /recordpostsale — Record weights at the end of a shift\n"
     "📦 /status — View current stock levels\n"
+)
+_HELP_EXCO_ONLY = (
     "📥 /restock — Log a delivery of new stock\n"
+    "🗑️ /discard — Write off expired or spoiled stock\n"
+)
+_HELP_BOTTOM = (
     "↩️ /undo — Undo the last entry\n"
     "🚫 /cancel — Cancel the current operation\n"
     "Start your shift with /recordpresale!"
 )
 
+HELP_TEXT_REGULAR = _HELP_TOP + _HELP_BOTTOM
+HELP_TEXT_EXCO = _HELP_TOP + _HELP_EXCO_ONLY + _HELP_BOTTOM
+
 # --- Google Sheets setup ---------------------------------------------------
 
 gc = gspread.service_account(filename="credentials.json")
-sh = gc.open("Cafe Logistics")
-sheet = sh.worksheet("working")
-main_sheet = sh.worksheet("main")
-restock_sheet = sh.worksheet("restocks")
+sh = gc.open("AY26/27 Logistics Tracker")
+sheet = sh.worksheet("Working")
+main_sheet = sh.worksheet("Main")
+restock_sheet = sh.worksheet("Restocks")
 
 
 # --- Helpers ---------------------------------------------------------------
@@ -108,28 +132,90 @@ def now_time_str() -> str:
     return datetime.now(TIMEZONE).strftime("%H:%M:%S")
 
 
-def is_authorised(user_id: int) -> bool:
-    """Return True if the user may use the bot.
+def is_exco(user_id: int) -> bool:
+    """Return True if the user is on the executive committee."""
+    return user_id in EXCO_USERS
 
-    When AUTHORIZED_USERS is None (unset/empty in .env) everyone is allowed, so
-    a forgotten config doesn't lock out all staff. Otherwise only listed IDs.
+
+def is_authorised(user_id: int) -> bool:
+    """Return True if the user may use the bot at all, in either tier.
+
+    EXCO membership implies base access, so an EXCO member listed only in
+    EXCO_USERS is still allowed in and need not appear in both lists.
     """
-    return AUTHORIZED_USERS is None or user_id in AUTHORIZED_USERS
+    return is_exco(user_id) or user_id in AUTHORIZED_USERS
+
+
+def help_text_for(user_id: int) -> str:
+    """Return the menu appropriate to the caller's tier.
+
+    An unlisted user is given their own Telegram ID instead of a menu: a new
+    staff member can then be onboarded without an EXCO member having to dig the
+    ID out of an alert, and no operational detail leaks to a stranger.
+    """
+    if is_exco(user_id):
+        return HELP_TEXT_EXCO
+    if is_authorised(user_id):
+        return HELP_TEXT_REGULAR
+    return (
+        "🚫 You are not authorised to use this bot.\n\n"
+        f"Your Telegram user ID is: {user_id}\n"
+        "Ask an EXCO member to add you."
+    )
+
+
+async def broadcast_to_exco(
+    context: ContextTypes.DEFAULT_TYPE, text: str, parse_mode=None
+) -> None:
+    """Send a message to every EXCO member, one chat at a time.
+
+    Failures are handled per recipient: Telegram refuses to let a bot message
+    anyone who has never started a chat with it, and one unreachable member must
+    not stop the rest from being told.
+    """
+    if not EXCO_USERS:
+        print(
+            "WARNING: EXCO_USERS is empty — admin notification dropped.",
+            file=sys.stderr,
+        )
+        return
+
+    for user_id in EXCO_USERS:
+        try:
+            await context.bot.send_message(
+                chat_id=user_id, text=text, parse_mode=parse_mode
+            )
+        except Exception as exc:  # noqa: BLE001 - alerting must never crash a caller
+            print(
+                f"WARNING: failed to notify EXCO member {user_id}: {exc}",
+                file=sys.stderr,
+            )
 
 
 async def deny_and_alert(update: Update, context: ContextTypes.DEFAULT_TYPE, command: str) -> None:
-    """Reply with the standard refusal and notify the admin (rate-limited)."""
+    """Refuse an unlisted user and alert EXCO (rate-limited)."""
     await update.message.reply_text("🚫 You are not authorised to use this bot.")
     await send_unauthorized_alert(update, context, command)
+
+
+async def deny_exco_only(update: Update, command: str) -> None:
+    """Refuse a regular user a privileged command. Deliberately does not alert.
+
+    An authorised staff member trying an EXCO command is not an intruder;
+    broadcasting it would be noise and would mislabel a colleague. Logged to
+    stderr so the attempt is still recoverable if it ever matters.
+    """
+    await update.message.reply_text(f"🔒 {command} is restricted to EXCO members.")
+    print(
+        f"INFO: user {update.effective_user.id} attempted EXCO command {command}",
+        file=sys.stderr,
+    )
 
 
 async def send_unauthorized_alert(
     update: Update, context: ContextTypes.DEFAULT_TYPE, command: str
 ) -> None:
-    """Send an admin alert about an unauthorized attempt, at most once/hour/user."""
-    if ADMIN_CHAT_ID is None:
-        return
-
+    """Alert EXCO about an unauthorized attempt, at most once/hour/user."""
     user = update.effective_user
     now = datetime.now(TIMEZONE)
 
@@ -150,10 +236,7 @@ async def send_unauthorized_alert(
         f"Command: {command}\n"
         f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')} SGT"
     )
-    try:
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
-    except Exception as exc:  # noqa: BLE001 - alerting must never crash a command
-        print(f"WARNING: failed to send unauthorized alert: {exc}", file=sys.stderr)
+    await broadcast_to_exco(context, text)
 
 
 def parse_non_negative_number(text: str):
@@ -267,13 +350,13 @@ def find_unclosed_shift_date():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Entry point shown to any user (authorised or not)."""
-    await update.message.reply_text(HELP_TEXT)
+    """Entry point. Shows the menu for the caller's tier; never alerts."""
+    await update.message.reply_text(help_text_for(update.effective_user.id))
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Same message as /start; accessible to all users."""
-    await update.message.reply_text(HELP_TEXT)
+    """Same message as /start."""
+    await update.message.reply_text(help_text_for(update.effective_user.id))
 
 
 # --- Presale flow ----------------------------------------------------------
@@ -479,6 +562,9 @@ async def restock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_authorised(update.effective_user.id):
         await deny_and_alert(update, context, "/restock")
         return ConversationHandler.END
+    if not is_exco(update.effective_user.id):
+        await deny_exco_only(update, "/restock")
+        return ConversationHandler.END
 
     context.user_data.clear()
     context.user_data["first_name"] = update.effective_user.first_name or "N/A"
@@ -524,8 +610,9 @@ async def restock_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     context.user_data["current_amount"] = amount
     await update.message.reply_text(
-        f'Enter the new expiry date for {ingredient} (DD/MM/YYYY) '
-        'or type "skip" to keep the current date:'
+        f"Enter the expiry date for this batch of {ingredient}.\n"
+        f"{EXPIRY_FORMAT_HINT}\n"
+        'Or type "skip" if it has no expiry date:'
     )
     return RESTOCK_EXPIRY
 
@@ -537,18 +624,22 @@ async def restock_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if text.lower() == "skip":
         expiry = None
     else:
-        # Only accept the DD/MM/YYYY format prompted for.
-        try:
-            parsed = datetime.strptime(text, "%d/%m/%Y").date()
-        except ValueError:
-            parsed = None
-        if parsed is None:
+        # Day-first only, either separator. Kept as a date object; written to the
+        # sheet as ISO and shown back to staff day-first.
+        expiry = None
+        for fmt in EXPIRY_INPUT_FORMATS:
+            try:
+                expiry = datetime.strptime(text, fmt).date()
+                break
+            except ValueError:
+                continue
+        if expiry is None:
             await update.message.reply_text(
-                f'❌ "{text}" is not a valid date. Please enter DD/MM/YYYY '
-                'or type "skip":'
+                f'❌ "{text}" is not a valid date.\n'
+                f"{EXPIRY_FORMAT_HINT}\n"
+                'Enter the expiry date, or type "skip":'
             )
             return RESTOCK_EXPIRY
-        expiry = parsed.strftime("%d/%m/%Y")
 
     context.user_data["restocks"].append(
         {
@@ -571,7 +662,9 @@ async def restock_another(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text('❌ Please answer "yes" or "no":')
         return RESTOCK_ANOTHER
 
-    # Finalise: write restock rows and update the main tab.
+    # Finalise: append one batch row per restock. Formulas in restocks!H:I and on
+    # the main tab derive stock levels and the next expiry date from these rows,
+    # so the bot never writes totals or expiry dates to the main tab.
     restocks = context.user_data.get("restocks", [])
     if not restocks:
         context.user_data.clear()
@@ -583,58 +676,21 @@ async def restock_another(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     first_name = context.user_data["first_name"]
 
     try:
-        main_records = main_sheet.get_all_values()
-    except Exception as exc:  # noqa: BLE001
-        await update.message.reply_text(
-            f"⚠️ Failed to read the sheet: {exc}\nPlease try again."
-        )
-        return ConversationHandler.END
-
-    # Build lookups from the main tab (A Ingredient, B Unit, C Initial Stock).
-    row_of = {}
-    unit_of = {}
-    stock_of = {}
-    for i, record in enumerate(main_records, start=1):
-        name = record[0].strip() if len(record) > 0 and record[0] else ""
-        if not name:
-            continue
-        row_of[name] = i
-        unit_of[name] = record[1] if len(record) > 1 else ""
-        stock_of[name] = parse_sheet_number(record[2] if len(record) > 2 else "") or 0.0
-
-    summary_lines = ["✅ Restock complete!", ""]
-    try:
         for item in restocks:
-            name = item["name"]
-            amount = item["amount"]
             expiry = item["expiry"]
-
-            # Log the delivery in the restocks tab.
-            restock_sheet.append_row([date, time_str, name, amount, first_name])
-
-            row_number = row_of.get(name)
-            unit = unit_of.get(name, "")
-
-            if row_number is None:
-                # Ingredient missing from main tab — record what we can.
-                summary_lines.append(
-                    f"{name}: +{fmt_number(amount)}{unit} "
-                    "(⚠️ not found in main tab, stock not updated)"
-                )
-                continue
-
-            new_total = stock_of.get(name, 0.0) + amount
-            stock_of[name] = new_total  # keep running total for repeats
-            main_sheet.update_cell(row_number, 3, new_total)  # Column C
-
-            expiry_note = ""
-            if expiry is not None:
-                main_sheet.update_cell(row_number, 6, expiry)  # Column F
-                expiry_note = f", expiry updated to {expiry}"
-
-            summary_lines.append(
-                f"{name}: +{fmt_number(amount)}{unit} "
-                f"(new total: {fmt_number(new_total)}{unit}{expiry_note})"
+            restock_sheet.append_row(
+                [
+                    date,
+                    time_str,
+                    item["name"],
+                    item["amount"],
+                    expiry.strftime("%Y-%m-%d") if expiry is not None else "",
+                    first_name,
+                ],
+                # A:G keeps the H:I formulas from pushing appends past the data;
+                # USER_ENTERED makes Sheets store the expiry as a real date.
+                table_range="A:G",
+                value_input_option="USER_ENTERED",
             )
     except Exception as exc:  # noqa: BLE001
         await update.message.reply_text(
@@ -644,8 +700,195 @@ async def restock_another(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data.clear()
         return ConversationHandler.END
 
+    # Read main AFTER the appends so the summary shows recalculated totals.
+    try:
+        main_records = main_sheet.get_all_values()
+    except Exception as exc:  # noqa: BLE001
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ Restock saved, but the summary could not be read back: {exc}\n"
+            "Use /status to check current levels."
+        )
+        return ConversationHandler.END
+
+    # main tab lookups: A Ingredient, B Unit, E Current Stock.
+    unit_of = {}
+    current_of = {}
+    for record in main_records:
+        name = record[0].strip() if len(record) > 0 and record[0] else ""
+        if not name:
+            continue
+        unit_of[name] = record[1] if len(record) > 1 else ""
+        current_of[name] = parse_sheet_number(record[4] if len(record) > 4 else "")
+
+    summary_lines = ["✅ Restock complete!", ""]
+    for item in restocks:
+        name = item["name"]
+        amount = item["amount"]
+        expiry = item["expiry"]
+
+        if name not in unit_of:
+            # Batch row was still logged; only the main-tab rollup is missing.
+            summary_lines.append(
+                f"{name}: +{fmt_number(amount)} "
+                "(⚠️ not found in main tab, stock not tracked)"
+            )
+            continue
+
+        unit = unit_of.get(name, "")
+        current = current_of.get(name)
+        total_note = f", now {fmt_number(current)}{unit}" if current is not None else ""
+        expiry_note = (
+            f", expires {expiry.strftime('%d/%m/%Y')}"
+            if expiry is not None
+            else ", no expiry date"
+        )
+        summary_lines.append(
+            f"{name}: +{fmt_number(amount)}{unit}{total_note}{expiry_note}"
+        )
+
     context.user_data.clear()
     await update.message.reply_text("\n".join(summary_lines))
+    return ConversationHandler.END
+
+
+# --- Discard flow ----------------------------------------------------------
+
+
+def live_batches(records):
+    """Return [(row_number, ingredient, remaining, expiry_raw)] for live batches.
+
+    A batch is "live" when its Remaining (column I, 0-based index 8 — a formula
+    on the restocks tab) is greater than 0. Row 1 is the header.
+    """
+    batches = []
+    for i, record in enumerate(records, start=1):
+        if i == 1:
+            continue
+        name = record[2].strip() if len(record) > 2 and record[2] else ""
+        if not name:
+            continue
+        remaining = parse_sheet_number(record[8] if len(record) > 8 else "")
+        if remaining is None or remaining <= 0:
+            continue
+        batches.append((i, name, remaining, record[4] if len(record) > 4 else ""))
+    return batches
+
+
+def _discard_menu(batches) -> str:
+    today = datetime.now(TIMEZONE).date()
+    lines = ["🗑️ Discard — Select a batch to write off:", ""]
+    for n, (_row, name, remaining, expiry_raw) in enumerate(batches, start=1):
+        expiry_date = parse_expiry_date(expiry_raw)
+        if expiry_date is None:
+            note = "no expiry date"
+        elif expiry_date < today:
+            note = f"⚠️ EXPIRED {expiry_date.strftime('%d/%m/%Y')}"
+        else:
+            note = f"expires {expiry_date.strftime('%d/%m/%Y')}"
+        lines.append(f"{n}. {name} — {fmt_number(remaining)} left, {note}")
+    lines.append("")
+    lines.append("Enter the number:")
+    return "\n".join(lines)
+
+
+async def discard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_authorised(update.effective_user.id):
+        await deny_and_alert(update, context, "/discard")
+        return ConversationHandler.END
+    if not is_exco(update.effective_user.id):
+        await deny_exco_only(update, "/discard")
+        return ConversationHandler.END
+
+    try:
+        records = restock_sheet.get_all_values()
+    except Exception as exc:  # noqa: BLE001 - surface any API error to user
+        await update.message.reply_text(
+            f"⚠️ Failed to read the sheet: {exc}\nPlease try again."
+        )
+        return ConversationHandler.END
+
+    batches = live_batches(records)
+    if not batches:
+        await update.message.reply_text(
+            "❌ There are no batches with stock left to write off."
+        )
+        return ConversationHandler.END
+
+    context.user_data.clear()
+    context.user_data["batches"] = batches
+
+    await update.message.reply_text(_discard_menu(batches))
+    return DISCARD_SELECT
+
+
+async def discard_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    batches = context.user_data["batches"]
+    try:
+        choice = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text(
+            f"❌ Please enter a valid number between 1 and {len(batches)}:"
+        )
+        return DISCARD_SELECT
+
+    if not 1 <= choice <= len(batches):
+        await update.message.reply_text(
+            f"❌ Please enter a number between 1 and {len(batches)}:"
+        )
+        return DISCARD_SELECT
+
+    row_number, name, remaining, _expiry = batches[choice - 1]
+    context.user_data["row_number"] = row_number
+    context.user_data["name"] = name
+    context.user_data["remaining"] = remaining
+
+    await update.message.reply_text(
+        f"{name} — {fmt_number(remaining)} left in this batch.\n"
+        'Enter the amount to write off, or type "all":'
+    )
+    return DISCARD_AMOUNT
+
+
+async def discard_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = context.user_data["name"]
+    remaining = context.user_data["remaining"]
+    row_number = context.user_data["row_number"]
+
+    text = update.message.text.strip()
+    if text.lower() == "all":
+        amount = remaining
+    else:
+        amount = parse_positive_number(text)
+        if amount is None:
+            await update.message.reply_text(
+                "❌ Amount must be a positive number greater than 0. "
+                f'Enter the amount to write off for {name}, or type "all":'
+            )
+            return DISCARD_AMOUNT
+        if amount > remaining:
+            await update.message.reply_text(
+                f"❌ Only {fmt_number(remaining)} left in this batch. "
+                'Enter a smaller amount, or type "all":'
+            )
+            return DISCARD_AMOUNT
+
+    # Written Off (column G) is cumulative — add to whatever is already there.
+    try:
+        existing = parse_sheet_number(restock_sheet.cell(row_number, 7).value) or 0.0
+        restock_sheet.update_cell(row_number, 7, existing + amount)
+    except Exception as exc:  # noqa: BLE001 - surface any API error to user
+        await update.message.reply_text(
+            f"⚠️ Failed to save the write-off to the sheet: {exc}\n"
+            "Your data is kept — please try again."
+        )
+        return DISCARD_AMOUNT
+
+    context.user_data.clear()
+    await update.message.reply_text(
+        f"🗑️ Wrote off {fmt_number(amount)} of {name}. "
+        f"{fmt_number(remaining - amount)} left in that batch."
+    )
     return ConversationHandler.END
 
 
@@ -735,8 +978,21 @@ async def undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     record = records[row_number - 1]
     date_cell = record[0] if len(record) > 0 else ""
     time_cell = record[1] if len(record) > 1 else ""
+    recorded_by = record[2].strip() if len(record) > 2 and record[2] else ""
     v60_postsale = record[12] if len(record) > 12 else ""
     postsale_filled = v60_postsale not in (None, "")
+
+    # Regular users may only undo their own entry; EXCO may undo anything. A
+    # blank "Recorded By" (hand-entered or backfilled rows) fails closed.
+    if not is_exco(update.effective_user.id):
+        caller = (update.effective_user.first_name or "").strip()
+        if not recorded_by or recorded_by != caller:
+            owner = recorded_by or "someone else"
+            await update.message.reply_text(
+                f"🔒 That entry was recorded by {owner}. "
+                "Only they or an EXCO member can undo it."
+            )
+            return
 
     try:
         if postsale_filled:
@@ -767,10 +1023,7 @@ async def undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def expiry_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Daily 7AM SGT: alert admin about expired / soon-to-expire ingredients."""
-    if ADMIN_CHAT_ID is None:
-        return
-
+    """Daily 7AM SGT: alert EXCO about expired / soon-to-expire ingredients."""
     try:
         records = main_sheet.get_all_values()
     except Exception as exc:  # noqa: BLE001
@@ -819,18 +1072,11 @@ async def expiry_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"  {name} — expires {d.strftime('%d/%m/%Y')} ({days_left} {word})"
             )
 
-    text = "\n".join(lines).rstrip()
-    try:
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
-    except Exception as exc:  # noqa: BLE001
-        print(f"WARNING: failed to send expiry alert: {exc}", file=sys.stderr)
+    await broadcast_to_exco(context, "\n".join(lines).rstrip())
 
 
 async def weekly_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Monday 7AM SGT: send the admin a usage summary for the previous week."""
-    if ADMIN_CHAT_ID is None:
-        return
-
+    """Monday 7AM SGT: send EXCO a usage summary for the previous week."""
     today = datetime.now(TIMEZONE).date()
     this_monday = today - timedelta(days=today.weekday())  # Monday of current week
     last_monday = this_monday - timedelta(days=7)
@@ -884,10 +1130,7 @@ async def weekly_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             f"📊 Weekly Summary — {range_str}\n\n"
             "No shift records found for this period."
         )
-        try:
-            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
-        except Exception as exc:  # noqa: BLE001
-            print(f"WARNING: failed to send weekly summary: {exc}", file=sys.stderr)
+        await broadcast_to_exco(context, text)
         return
 
     table = [f"{'Ingredient':<18}{'Used':<10}Shifts"]
@@ -901,19 +1144,36 @@ async def weekly_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         "```\n" + "\n".join(table) + "\n```\n\n"
         f"Total shifts recorded: {total_shifts}"
     )
-    try:
-        await context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID, text=text, parse_mode="Markdown"
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(f"WARNING: failed to send weekly summary: {exc}", file=sys.stderr)
+    await broadcast_to_exco(context, text, parse_mode="Markdown")
 
 
 # --- Main ------------------------------------------------------------------
 
 
+def parse_user_ids(raw: str, name: str) -> frozenset:
+    """Parse a comma-separated list of Telegram user IDs from .env.
+
+    Invalid entries are named on stderr and skipped rather than raising, so one
+    typo can't stop the bot from starting. Skipping only ever removes access,
+    never grants it, so the failure direction is safe.
+    """
+    ids = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            print(
+                f"WARNING: ignoring invalid entry {part!r} in {name}.",
+                file=sys.stderr,
+            )
+    return frozenset(ids)
+
+
 def main() -> None:
-    global AUTHORIZED_USERS, ADMIN_CHAT_ID
+    global AUTHORIZED_USERS, EXCO_USERS
 
     load_dotenv()
     token = os.getenv("TELEGRAM_TOKEN")
@@ -921,27 +1181,34 @@ def main() -> None:
         print("ERROR: TELEGRAM_TOKEN is missing or empty in .env", file=sys.stderr)
         sys.exit(1)
 
-    # Parse authorised Telegram user IDs. Empty/unset -> None (allow everyone).
-    raw_ids = os.getenv("AUTHORIZED_USERS", "")
-    ids = {int(part) for part in raw_ids.split(",") if part.strip()}
-    AUTHORIZED_USERS = ids if ids else None
-    if AUTHORIZED_USERS is None:
-        print("WARNING: AUTHORIZED_USERS is empty — all users are allowed.")
+    AUTHORIZED_USERS = parse_user_ids(
+        os.getenv("AUTHORIZED_USERS", ""), "AUTHORIZED_USERS"
+    )
+    EXCO_USERS = parse_user_ids(os.getenv("EXCO_USERS", ""), "EXCO_USERS")
 
-    # Admin chat ID for alerts / scheduled reports. Optional.
-    raw_admin = os.getenv("ADMIN_CHAT_ID", "").strip()
-    if raw_admin:
-        try:
-            ADMIN_CHAT_ID = int(raw_admin)
-        except ValueError:
-            print(
-                f"WARNING: ADMIN_CHAT_ID '{raw_admin}' is not a valid integer — "
-                "admin alerts disabled.",
-                file=sys.stderr,
-            )
-            ADMIN_CHAT_ID = None
-    else:
-        print("WARNING: ADMIN_CHAT_ID is not set — admin alerts disabled.")
+    # Both tiers fail closed, so an empty list is an outage rather than a
+    # permissive default. Say so loudly — this is the main way a bad deploy
+    # shows itself.
+    print("--- Access control ---")
+    print(f"  EXCO users:    {len(EXCO_USERS)}")
+    print(f"  Regular users: {len(AUTHORIZED_USERS - EXCO_USERS)}")
+    if not EXCO_USERS:
+        print(
+            "  WARNING: EXCO_USERS is empty — /restock and /discard are "
+            "unavailable and NO admin alerts can be sent.",
+            file=sys.stderr,
+        )
+    if not AUTHORIZED_USERS and not EXCO_USERS:
+        print(
+            "  WARNING: both lists are empty — nobody can use the bot.",
+            file=sys.stderr,
+        )
+    if os.getenv("ADMIN_CHAT_ID", "").strip():
+        print(
+            "  NOTE: ADMIN_CHAT_ID is set but no longer used — "
+            "alerts now go to EXCO_USERS."
+        )
+    print("----------------------")
 
     application = Application.builder().token(token).build()
 
@@ -984,11 +1251,25 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    discard_conv = ConversationHandler(
+        entry_points=[CommandHandler("discard", discard)],
+        states={
+            DISCARD_SELECT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, discard_select)
+            ],
+            DISCARD_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, discard_amount)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(presale_conv)
     application.add_handler(postsale_conv)
     application.add_handler(restock_conv)
+    application.add_handler(discard_conv)
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("undo", undo))
 
