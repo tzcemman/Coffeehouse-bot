@@ -63,12 +63,17 @@ RESTOCK_ANOTHER = 13
 DISCARD_SELECT = 20
 DISCARD_AMOUNT = 21
 
-# Telegram user IDs per tier, populated in main() from AUTHORIZED_USERS and
-# EXCO_USERS. Both fail closed: an empty set grants nothing, so a missing or
-# misspelt .env entry can never hand out access. EXCO membership implies base
-# access, so allowed = AUTHORIZED_USERS | EXCO_USERS.
-AUTHORIZED_USERS = frozenset()
+# Telegram user IDs per tier, populated in main() from the matching .env names.
+# All three fail closed: an empty set grants nothing, so a missing or misspelt
+# entry can never hand out access.
+#
+# The tiers cascade — ADMIN ⊃ EXCO ⊃ regular — so nobody needs listing twice:
+#   ADMIN_USERS       everything EXCO can do, plus unauthorized-access alerts
+#   EXCO_USERS        /restock, /discard, expiry alerts, weekly summary
+#   AUTHORIZED_USERS  shift commands only
+ADMIN_USERS = frozenset()
 EXCO_USERS = frozenset()
+AUTHORIZED_USERS = frozenset()
 
 # In-memory rate-limit tracker for unauthorized-access alerts: user_id -> last
 # alert datetime. Not persisted; resets on restart, which is fine.
@@ -132,16 +137,23 @@ def now_time_str() -> str:
     return datetime.now(TIMEZONE).strftime("%H:%M:%S")
 
 
+def is_admin(user_id: int) -> bool:
+    """Return True if the user receives unauthorized-access alerts."""
+    return user_id in ADMIN_USERS
+
+
 def is_exco(user_id: int) -> bool:
-    """Return True if the user is on the executive committee."""
-    return user_id in EXCO_USERS
+    """Return True if the user has executive-committee powers.
+
+    Admins are implicitly EXCO, so they need not appear in both lists.
+    """
+    return is_admin(user_id) or user_id in EXCO_USERS
 
 
 def is_authorised(user_id: int) -> bool:
-    """Return True if the user may use the bot at all, in either tier.
+    """Return True if the user may use the bot at all, in any tier.
 
-    EXCO membership implies base access, so an EXCO member listed only in
-    EXCO_USERS is still allowed in and need not appear in both lists.
+    The tiers cascade, so membership of a higher list is enough on its own.
     """
     return is_exco(user_id) or user_id in AUTHORIZED_USERS
 
@@ -164,32 +176,57 @@ def help_text_for(user_id: int) -> str:
     )
 
 
-async def broadcast_to_exco(
-    context: ContextTypes.DEFAULT_TYPE, text: str, parse_mode=None
+async def _broadcast(
+    context: ContextTypes.DEFAULT_TYPE,
+    recipients,
+    audience: str,
+    text: str,
+    parse_mode=None,
 ) -> None:
-    """Send a message to every EXCO member, one chat at a time.
+    """Send a message to each recipient, one chat at a time.
 
     Failures are handled per recipient: Telegram refuses to let a bot message
-    anyone who has never started a chat with it, and one unreachable member must
+    anyone who has never started a chat with it, and one unreachable person must
     not stop the rest from being told.
     """
-    if not EXCO_USERS:
+    if not recipients:
         print(
-            "WARNING: EXCO_USERS is empty — admin notification dropped.",
+            f"WARNING: no {audience} recipients configured — notification dropped.",
             file=sys.stderr,
         )
         return
 
-    for user_id in EXCO_USERS:
+    for user_id in recipients:
         try:
             await context.bot.send_message(
                 chat_id=user_id, text=text, parse_mode=parse_mode
             )
         except Exception as exc:  # noqa: BLE001 - alerting must never crash a caller
             print(
-                f"WARNING: failed to notify EXCO member {user_id}: {exc}",
+                f"WARNING: failed to notify {audience} member {user_id}: {exc}",
                 file=sys.stderr,
             )
+
+
+async def broadcast_to_exco(
+    context: ContextTypes.DEFAULT_TYPE, text: str, parse_mode=None
+) -> None:
+    """Operational notifications: expiry alerts and the weekly summary.
+
+    Goes to admins as well as EXCO, since admins hold every EXCO power.
+    """
+    await _broadcast(context, EXCO_USERS | ADMIN_USERS, "EXCO", text, parse_mode)
+
+
+async def broadcast_to_admin(
+    context: ContextTypes.DEFAULT_TYPE, text: str, parse_mode=None
+) -> None:
+    """Security notifications: unauthorized access attempts, admins only.
+
+    Kept separate from broadcast_to_exco so a stranger poking at the bot cannot
+    generate noise for the whole committee.
+    """
+    await _broadcast(context, ADMIN_USERS, "admin", text, parse_mode)
 
 
 async def deny_and_alert(update: Update, context: ContextTypes.DEFAULT_TYPE, command: str) -> None:
@@ -215,7 +252,7 @@ async def deny_exco_only(update: Update, command: str) -> None:
 async def send_unauthorized_alert(
     update: Update, context: ContextTypes.DEFAULT_TYPE, command: str
 ) -> None:
-    """Alert EXCO about an unauthorized attempt, at most once/hour/user."""
+    """Alert the admins about an unauthorized attempt, at most once/hour/user."""
     user = update.effective_user
     now = datetime.now(TIMEZONE)
 
@@ -236,7 +273,7 @@ async def send_unauthorized_alert(
         f"Command: {command}\n"
         f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')} SGT"
     )
-    await broadcast_to_exco(context, text)
+    await broadcast_to_admin(context, text)
 
 
 def parse_non_negative_number(text: str):
@@ -350,13 +387,34 @@ def find_unclosed_shift_date():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Entry point. Shows the menu for the caller's tier; never alerts."""
-    await update.message.reply_text(help_text_for(update.effective_user.id))
+    """Entry point. Shows the menu for the caller's tier."""
+    await _menu_and_alert(update, context, "/start")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Same message as /start."""
-    await update.message.reply_text(help_text_for(update.effective_user.id))
+    await _menu_and_alert(update, context, "/help")
+
+
+async def _menu_and_alert(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, command: str
+) -> None:
+    """Reply with the caller's menu, alerting admins if they are unlisted.
+
+    These two commands stay open to everyone so a prospective staff member can
+    collect their own user ID. The attempt still reaches the admins, who alone
+    receive security alerts — so a stranger finding the bot cannot generate
+    noise for the wider committee.
+
+    Alerts via send_unauthorized_alert rather than deny_and_alert because
+    help_text_for() has already replied with the refusal; deny_and_alert would
+    send a second one. Still rate-limited to once an hour per user, shared with
+    every other command.
+    """
+    user_id = update.effective_user.id
+    await update.message.reply_text(help_text_for(user_id))
+    if not is_authorised(user_id):
+        await send_unauthorized_alert(update, context, command)
 
 
 # --- Presale flow ----------------------------------------------------------
@@ -1173,7 +1231,7 @@ def parse_user_ids(raw: str, name: str) -> frozenset:
 
 
 def main() -> None:
-    global AUTHORIZED_USERS, EXCO_USERS
+    global AUTHORIZED_USERS, EXCO_USERS, ADMIN_USERS
 
     load_dotenv()
     token = os.getenv("TELEGRAM_TOKEN")
@@ -1181,32 +1239,42 @@ def main() -> None:
         print("ERROR: TELEGRAM_TOKEN is missing or empty in .env", file=sys.stderr)
         sys.exit(1)
 
+    ADMIN_USERS = parse_user_ids(os.getenv("ADMIN_USERS", ""), "ADMIN_USERS")
+    EXCO_USERS = parse_user_ids(os.getenv("EXCO_USERS", ""), "EXCO_USERS")
     AUTHORIZED_USERS = parse_user_ids(
         os.getenv("AUTHORIZED_USERS", ""), "AUTHORIZED_USERS"
     )
-    EXCO_USERS = parse_user_ids(os.getenv("EXCO_USERS", ""), "EXCO_USERS")
 
-    # Both tiers fail closed, so an empty list is an outage rather than a
+    # Every tier fails closed, so an empty list is an outage rather than a
     # permissive default. Say so loudly — this is the main way a bad deploy
-    # shows itself.
+    # shows itself. Counts are reported per distinct tier, so somebody listed
+    # in two lists is only counted at their highest.
+    everyone = ADMIN_USERS | EXCO_USERS | AUTHORIZED_USERS
     print("--- Access control ---")
-    print(f"  EXCO users:    {len(EXCO_USERS)}")
-    print(f"  Regular users: {len(AUTHORIZED_USERS - EXCO_USERS)}")
-    if not EXCO_USERS:
+    print(f"  Admins:        {len(ADMIN_USERS)}")
+    print(f"  EXCO users:    {len(EXCO_USERS - ADMIN_USERS)}")
+    print(f"  Regular users: {len(AUTHORIZED_USERS - EXCO_USERS - ADMIN_USERS)}")
+    if not ADMIN_USERS:
         print(
-            "  WARNING: EXCO_USERS is empty — /restock and /discard are "
-            "unavailable and NO admin alerts can be sent.",
+            "  WARNING: ADMIN_USERS is empty — NO unauthorized-access alerts "
+            "can be sent to anyone.",
             file=sys.stderr,
         )
-    if not AUTHORIZED_USERS and not EXCO_USERS:
+    if not (EXCO_USERS | ADMIN_USERS):
         print(
-            "  WARNING: both lists are empty — nobody can use the bot.",
+            "  WARNING: no admins or EXCO — /restock and /discard are "
+            "unavailable, and expiry/weekly reports go nowhere.",
+            file=sys.stderr,
+        )
+    if not everyone:
+        print(
+            "  WARNING: all three lists are empty — nobody can use the bot.",
             file=sys.stderr,
         )
     if os.getenv("ADMIN_CHAT_ID", "").strip():
         print(
             "  NOTE: ADMIN_CHAT_ID is set but no longer used — "
-            "alerts now go to EXCO_USERS."
+            "security alerts now go to ADMIN_USERS."
         )
     print("----------------------")
 
