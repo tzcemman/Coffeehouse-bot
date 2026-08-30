@@ -1,25 +1,3 @@
-"""Cafe Logistics Telegram Bot.
-
-Tracks cafe ingredient inventory by writing presale/postsale weights to a
-Google Sheet ("Cafe Logistics", tab "working"). Formulas in the sheet handle
-usage calculations; the bot only writes Date (A), Time (B), Recorded By (C),
-presale (cols D-L) and postsale (cols M-U) values.
-
-Working tab layout (1-based columns):
-  A Date | B Time | C Recorded By | D-L Presale (9) | M-U Postsale (9)
-  | V-AD Usage (9, ARRAYFORMULA — bot never touches)
-
-Phase 5 adds: multi-user "Recorded By" column, /start & /help, unauthorized
-access alerts, /restock, daily expiry alerts, and a weekly summary report.
-
-Phase 6 turns the "restocks" tab into a batch ledger: one row per delivery,
-each with its own expiry date. Formulas on that tab run a FIFO waterfall to
-work out how much of each batch is left, and the main tab derives stock levels
-and the next relevant expiry date from it. The bot therefore only ever appends
-batch rows (/restock) or writes to the Written Off column (/discard) — it never
-writes stock totals or expiry dates to the main tab.
-"""
-
 import os
 import sys
 from datetime import datetime, time, timedelta
@@ -27,7 +5,14 @@ from datetime import datetime, time, timedelta
 import gspread
 import pytz
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -51,6 +36,28 @@ INGREDIENTS = [
     "Milk",
 ]
 
+# Unit each ingredient is measured in. Everything is weighed in grams except
+# milk and oat milk, which are counted as cartons. Keep this matching the Unit
+# column (B) of the Main tab, which /restock and /status read from.
+UNITS = {
+    "V60": "g",
+    "Espresso Beans": "g",
+    "Chocolate": "g",
+    "Vanilla": "g",
+    "Matcha": "g",
+    "Caramel": "g",
+    "Sugar": "g",
+    "Oatmilk": "cartons",
+    "Milk": "cartons",
+}
+
+# Ingredients that come in named varieties, recorded per delivery in the
+# Restocks ledger. A set so more can be added without touching any logic.
+VARIETAL_INGREDIENTS = {"V60"}
+
+# How many days ahead the daily job warns about an upcoming expiry.
+EXPIRY_WARNING_DAYS = 7
+
 TIMEZONE = pytz.timezone("Asia/Singapore")
 
 # Conversation states
@@ -58,6 +65,7 @@ WAITING_FOR_PRESALE = 1
 WAITING_FOR_POSTSALE = 2
 RESTOCK_SELECT = 10
 RESTOCK_AMOUNT = 11
+RESTOCK_VARIETY = 14
 RESTOCK_EXPIRY = 12
 RESTOCK_ANOTHER = 13
 DISCARD_SELECT = 20
@@ -114,6 +122,35 @@ _HELP_BOTTOM = (
 
 HELP_TEXT_REGULAR = _HELP_TOP + _HELP_BOTTOM
 HELP_TEXT_EXCO = _HELP_TOP + _HELP_EXCO_ONLY + _HELP_BOTTOM
+
+# Shift shortcut buttons, shown to regular staff only. Telegram sends a reply
+# keyboard button's LABEL as an ordinary text message — it does not invoke a
+# command — so these strings are matched exactly to route to the shift flows.
+# Both the keyboard and the matching filter read them from here: change a label
+# in only one of the two places and the button silently stops working.
+BTN_PRESALE = "Starting a shift? 👀"
+BTN_POSTSALE = "Closing a shift? 🥹"
+SHIFT_BUTTONS = (BTN_PRESALE, BTN_POSTSALE)
+
+# Telegram command menus, per tier. Built from shared pieces so they cannot
+# drift from HELP_TEXT_* above.
+_CMDS_TOP = [
+    BotCommand("recordpresale", "Record weights at the start of a shift"),
+    BotCommand("recordpostsale", "Record weights at the end of a shift"),
+    BotCommand("status", "View current stock levels"),
+]
+_CMDS_EXCO_ONLY = [
+    BotCommand("restock", "Log a delivery of new stock"),
+    BotCommand("discard", "Write off expired or spoiled stock"),
+]
+_CMDS_BOTTOM = [
+    BotCommand("undo", "Undo the last entry"),
+    BotCommand("cancel", "Cancel the current operation"),
+    BotCommand("help", "Show what I can do"),
+]
+
+COMMANDS_REGULAR = _CMDS_TOP + _CMDS_BOTTOM
+COMMANDS_EXCO = _CMDS_TOP + _CMDS_EXCO_ONLY + _CMDS_BOTTOM
 
 # --- Google Sheets setup ---------------------------------------------------
 
@@ -174,6 +211,62 @@ def help_text_for(user_id: int) -> str:
         f"Your Telegram user ID is: {user_id}\n"
         "Ask an EXCO member to add you."
     )
+
+
+def keyboard_for(user_id: int):
+    """Shift shortcut buttons for regular staff; a keyboard clear for everyone else.
+
+    Returns ReplyKeyboardRemove rather than None for the other tiers on purpose:
+    someone promoted out of the regular tier would otherwise keep buttons their
+    tier no longer uses, since a reply keyboard persists until something
+    replaces it.
+    """
+    if is_authorised(user_id) and not is_exco(user_id):
+        return ReplyKeyboardMarkup(
+            [[BTN_PRESALE], [BTN_POSTSALE]],  # one per row — bigger tap targets
+            resize_keyboard=True,
+            is_persistent=True,
+        )
+    return ReplyKeyboardRemove()
+
+
+def commands_for(user_id: int):
+    """The command menu appropriate to the caller's tier."""
+    return COMMANDS_EXCO if is_exco(user_id) else COMMANDS_REGULAR
+
+
+async def sync_commands_for(bot, user_id: int) -> None:
+    """Set one user's command menu to match their tier. Never raises.
+
+    Every user gets an explicit per-chat scope rather than relying on the
+    default, so a tier change corrects itself — without this, someone demoted
+    from EXCO would keep seeing /restock and /discard indefinitely.
+
+    Telegram refuses this for anyone who has never messaged the bot, the same
+    limitation broadcast_to_exco works around, so failures are logged and
+    swallowed.
+    """
+    try:
+        await bot.set_my_commands(
+            commands_for(user_id), scope=BotCommandScopeChat(chat_id=user_id)
+        )
+    except Exception as exc:  # noqa: BLE001 - menus must never break a command
+        print(
+            f"WARNING: could not set command menu for {user_id}: {exc}",
+            file=sys.stderr,
+        )
+
+
+async def sync_all_command_menus(application) -> None:
+    """post_init hook: default menu, then a per-chat menu for every known user."""
+    bot = application.bot
+    try:
+        await bot.set_my_commands(COMMANDS_REGULAR, scope=BotCommandScopeDefault())
+    except Exception as exc:  # noqa: BLE001 - startup must not fail on this
+        print(f"WARNING: could not set the default command menu: {exc}", file=sys.stderr)
+
+    for user_id in ADMIN_USERS | EXCO_USERS | AUTHORIZED_USERS:
+        await sync_commands_for(bot, user_id)
 
 
 async def _broadcast(
@@ -346,6 +439,104 @@ def fmt_number(value) -> str:
     return f"{value:,.1f}"
 
 
+# Unit symbols abut the number ("500g"); word units take a space ("3 cartons").
+_SYMBOL_UNITS = {"g", "kg", "ml", "l", "L"}
+
+
+def fmt_qty(value, unit) -> str:
+    """Format a quantity with its unit, readably.
+
+    Symbols abut the number, words are spaced, and a word unit is singularised
+    at exactly one so it reads "1 carton" rather than "1 cartons".
+    """
+    number = fmt_number(value)
+    unit = (unit or "").strip()
+    if not unit:
+        return number
+    if unit in _SYMBOL_UNITS:
+        return f"{number}{unit}"
+    if value == 1 and unit.endswith("s"):
+        unit = unit[:-1]
+    return f"{number} {unit}"
+
+
+def amount_prompt(ingredient: str, variety: str = "") -> str:
+    """Prompt asking for one ingredient's amount, in that ingredient's own unit.
+
+    Varietal ingredients carry the variety in use, so staff can see which beans
+    the number they are about to type belongs to.
+    """
+    label = f"{ingredient} ({variety})" if variety else ingredient
+    return f"Enter the amount ({UNITS.get(ingredient, '')}) for {label}:"
+
+
+def variety_breakdown(restock_records, ingredient: str):
+    """Return [(variety, remaining)] for one ingredient's live batches.
+
+    Batches sharing a variety are summed, and blank varieties (older rows
+    predating variety tracking) group under "unspecified".
+    """
+    totals = {}
+    for _row, name, remaining, _expiry, variety in live_batches(restock_records):
+        if name != ingredient:
+            continue
+        key = variety or "unspecified"
+        totals[key] = totals.get(key, 0.0) + remaining
+    return sorted(totals.items())
+
+
+def stock_lines(main_records, restock_records=()):
+    """Render current stock per ingredient, shared by /status and the summary.
+
+    Main tab columns: A Ingredient, B Unit, E Current Stock, G Status. Data
+    lives in rows 2-10. Varietal ingredients gain an indented per-variety
+    breakdown beneath their pooled total.
+    """
+    lines = []
+    for record in main_records[1:10]:
+        ingredient = record[0] if len(record) > 0 else ""
+        if not ingredient:
+            continue
+        unit = record[1] if len(record) > 1 else ""
+        current_stock = record[4] if len(record) > 4 else ""
+        status_flag = record[6] if len(record) > 6 else ""
+        emoji = STATUS_EMOJI.get(status_flag.strip().upper(), "")
+        emoji_part = f" {emoji}" if emoji else ""
+        status_part = f" {status_flag}" if status_flag else ""
+        lines.append(f"{ingredient}: {current_stock}{unit}{emoji_part}{status_part}")
+
+        if ingredient in VARIETAL_INGREDIENTS and restock_records:
+            for variety, remaining in variety_breakdown(restock_records, ingredient):
+                lines.append(f"   • {variety}: {fmt_qty(remaining, unit)}")
+    return lines
+
+
+def fetch_current_varieties() -> dict:
+    """Resolve the variety in use per varietal ingredient, from the ledger.
+
+    Never raises: a labelling failure must not stop a shift being recorded, so
+    it degrades to unlabelled prompts.
+    """
+    try:
+        return current_varieties(restock_sheet.get_all_values())
+    except Exception as exc:  # noqa: BLE001 - labelling must not block a shift
+        print(f"WARNING: could not resolve varieties: {exc}", file=sys.stderr)
+        return {}
+
+
+def current_varieties(restock_records) -> dict:
+    """Map ingredient -> variety of its oldest live batch, for varietal items.
+
+    "Oldest live" follows the same FIFO order the sheet uses to draw stock down,
+    so the variety named is the one the ledger believes is being consumed.
+    """
+    found = {}
+    for _row, name, _remaining, _expiry, variety in live_batches(restock_records):
+        if name in VARIETAL_INGREDIENTS and name not in found and variety:
+            found[name] = variety
+    return found
+
+
 def find_open_presale_row(today: str):
     """Return the 1-based row number of today's open presale row, or None.
 
@@ -412,7 +603,15 @@ async def _menu_and_alert(
     every other command.
     """
     user_id = update.effective_user.id
-    await update.message.reply_text(help_text_for(user_id))
+
+    # Refresh the command menu here as well as at startup, so a user added
+    # after the bot booted — or whose tier changed — is corrected on first
+    # contact rather than waiting for a restart.
+    await sync_commands_for(context.bot, user_id)
+
+    await update.message.reply_text(
+        help_text_for(user_id), reply_markup=keyboard_for(user_id)
+    )
     if not is_authorised(user_id):
         await send_unauthorized_alert(update, context, command)
 
@@ -449,9 +648,13 @@ async def recordpresale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     context.user_data["ingredient_index"] = 0
     context.user_data["values"] = []
 
+    context.user_data["varieties"] = fetch_current_varieties()
+
     await update.message.reply_text(
         f"📋 Recording presale for {context.user_data['date']}.\n\n"
-        f"Enter the amount (g) for {INGREDIENTS[0]}:"
+        + amount_prompt(
+            INGREDIENTS[0], context.user_data["varieties"].get(INGREDIENTS[0], "")
+        )
     )
     return WAITING_FOR_PRESALE
 
@@ -459,6 +662,16 @@ async def recordpresale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 async def presale_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     index = context.user_data["ingredient_index"]
     ingredient = INGREDIENTS[index]
+
+    # The shift keyboard stays on screen mid-flow, so a stray tap arrives here
+    # as text. Say what is actually happening rather than rejecting it as an
+    # invalid number.
+    if update.message.text in SHIFT_BUTTONS:
+        await update.message.reply_text(
+            "You're already recording a shift. Finish it, or /cancel to abandon "
+            f"it.\n\n{amount_prompt(ingredient, context.user_data['varieties'].get(ingredient, ''))}"
+        )
+        return WAITING_FOR_PRESALE
 
     amount = parse_non_negative_number(update.message.text)
     if amount is None:
@@ -469,14 +682,17 @@ async def presale_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return WAITING_FOR_PRESALE
 
     context.user_data["values"].append(amount)
-    await update.message.reply_text(f"✓ {ingredient} recorded: {amount}g")
+    await update.message.reply_text(
+        f"✓ {ingredient} recorded: {fmt_qty(amount, UNITS.get(ingredient, ''))}"
+    )
 
     index += 1
     context.user_data["ingredient_index"] = index
 
     if index < len(INGREDIENTS):
         await update.message.reply_text(
-            f"Enter the amount (g) for {INGREDIENTS[index]}:"
+            amount_prompt(INGREDIENTS[index],
+                          context.user_data["varieties"].get(INGREDIENTS[index], ""))
         )
         return WAITING_FOR_PRESALE
 
@@ -538,9 +754,13 @@ async def recordpostsale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     context.user_data["ingredient_index"] = 0
     context.user_data["values"] = []
 
+    context.user_data["varieties"] = fetch_current_varieties()
+
     await update.message.reply_text(
         f"📋 Recording postsale for {context.user_data['date']}.\n\n"
-        f"Enter the amount (g) for {INGREDIENTS[0]}:"
+        + amount_prompt(
+            INGREDIENTS[0], context.user_data["varieties"].get(INGREDIENTS[0], "")
+        )
     )
     return WAITING_FOR_POSTSALE
 
@@ -548,6 +768,14 @@ async def recordpostsale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def postsale_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     index = context.user_data["ingredient_index"]
     ingredient = INGREDIENTS[index]
+
+    # See presale_input — a stray keyboard tap mid-flow arrives here as text.
+    if update.message.text in SHIFT_BUTTONS:
+        await update.message.reply_text(
+            "You're already recording a shift. Finish it, or /cancel to abandon "
+            f"it.\n\n{amount_prompt(ingredient, context.user_data['varieties'].get(ingredient, ''))}"
+        )
+        return WAITING_FOR_POSTSALE
 
     amount = parse_non_negative_number(update.message.text)
     if amount is None:
@@ -558,14 +786,17 @@ async def postsale_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return WAITING_FOR_POSTSALE
 
     context.user_data["values"].append(amount)
-    await update.message.reply_text(f"✓ {ingredient} recorded: {amount}g")
+    await update.message.reply_text(
+        f"✓ {ingredient} recorded: {fmt_qty(amount, UNITS.get(ingredient, ''))}"
+    )
 
     index += 1
     context.user_data["ingredient_index"] = index
 
     if index < len(INGREDIENTS):
         await update.message.reply_text(
-            f"Enter the amount (g) for {INGREDIENTS[index]}:"
+            amount_prompt(INGREDIENTS[index],
+                          context.user_data["varieties"].get(INGREDIENTS[index], ""))
         )
         return WAITING_FOR_POSTSALE
 
@@ -626,7 +857,7 @@ async def restock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     context.user_data.clear()
     context.user_data["first_name"] = update.effective_user.first_name or "N/A"
-    context.user_data["restocks"] = []  # list of {name, amount, expiry}
+    context.user_data["restocks"] = []  # {name, amount, expiry, variety}
 
     await update.message.reply_text(_restock_menu())
     return RESTOCK_SELECT
@@ -650,8 +881,104 @@ async def restock_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     ingredient = INGREDIENTS[choice - 1]
     context.user_data["current_ingredient"] = ingredient
+
+    if ingredient in VARIETAL_INGREDIENTS:
+        return await ask_variety(update, context, ingredient)
+
+    context.user_data["current_variety"] = ""
     await update.message.reply_text(
-        f"Enter the restock amount for {ingredient}:"
+        f"Enter the restock amount for {ingredient} ({UNITS.get(ingredient, '')}):"
+    )
+    return RESTOCK_AMOUNT
+
+
+def known_varieties(restock_records, ingredient: str):
+    """Distinct variety names already used for this ingredient, in first-seen order.
+
+    Offering these back as a menu is what keeps grouping reliable: free text
+    would let "Ethiopian", "ethiopian" and "Yirg" become three separate
+    varieties in every total, with nothing to flag that it happened.
+    """
+    seen = []
+    for record in restock_records[1:]:
+        name = record[2].strip() if len(record) > 2 and record[2] else ""
+        variety = (record[6] or "").strip() if len(record) > 6 else ""
+        if name == ingredient and variety and variety not in seen:
+            seen.append(variety)
+    return seen
+
+
+async def ask_variety(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, ingredient: str
+) -> int:
+    """Prompt for the variety, offering previously used names where there are any."""
+    try:
+        known = known_varieties(restock_sheet.get_all_values(), ingredient)
+    except Exception as exc:  # noqa: BLE001 - fall back to free text
+        print(f"WARNING: could not list past varieties: {exc}", file=sys.stderr)
+        known = []
+
+    context.user_data["known_varieties"] = known
+
+    if not known:
+        await update.message.reply_text(
+            f"Which variety of {ingredient} is this? Type the name:"
+        )
+        return RESTOCK_VARIETY
+
+    lines = [f"Which variety of {ingredient} is this?", ""]
+    for i, variety in enumerate(known, start=1):
+        lines.append(f"{i}. {variety}")
+    lines.append(f"{len(known) + 1}. Something new")
+    lines.append("")
+    lines.append("Enter the number:")
+    await update.message.reply_text("\n".join(lines))
+    return RESTOCK_VARIETY
+
+
+async def restock_variety(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    ingredient = context.user_data["current_ingredient"]
+    known = context.user_data.get("known_varieties", [])
+
+    if known:
+        try:
+            choice = int(text)
+        except ValueError:
+            await update.message.reply_text(
+                f"❌ Please enter a number between 1 and {len(known) + 1}:"
+            )
+            return RESTOCK_VARIETY
+
+        if not 1 <= choice <= len(known) + 1:
+            await update.message.reply_text(
+                f"❌ Please enter a number between 1 and {len(known) + 1}:"
+            )
+            return RESTOCK_VARIETY
+
+        if choice <= len(known):
+            context.user_data["current_variety"] = known[choice - 1]
+            await update.message.reply_text(
+                f"Enter the restock amount for {ingredient} "
+                f"({UNITS.get(ingredient, '')}):"
+            )
+            return RESTOCK_AMOUNT
+
+        # "Something new" -> ask for free text next time round.
+        context.user_data["known_varieties"] = []
+        await update.message.reply_text(
+            f"Type the name of the new {ingredient} variety:"
+        )
+        return RESTOCK_VARIETY
+
+    if not text:
+        await update.message.reply_text("❌ Please type a variety name:")
+        return RESTOCK_VARIETY
+
+    context.user_data["current_variety"] = text
+    await update.message.reply_text(
+        f"Enter the restock amount for {ingredient} ({text}) "
+        f"({UNITS.get(ingredient, '')}):"
     )
     return RESTOCK_AMOUNT
 
@@ -704,6 +1031,7 @@ async def restock_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "name": ingredient,
             "amount": context.user_data["current_amount"],
             "expiry": expiry,
+            "variety": context.user_data.get("current_variety", ""),
         }
     )
 
@@ -744,10 +1072,11 @@ async def restock_another(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     item["amount"],
                     expiry.strftime("%Y-%m-%d") if expiry is not None else "",
                     first_name,
+                    item.get("variety", ""),
                 ],
-                # A:G keeps the H:I formulas from pushing appends past the data;
+                # A:H keeps the I:J formulas from pushing appends past the data;
                 # USER_ENTERED makes Sheets store the expiry as a real date.
-                table_range="A:G",
+                table_range="A:H",
                 value_input_option="USER_ENTERED",
             )
     except Exception as exc:  # noqa: BLE001
@@ -785,24 +1114,29 @@ async def restock_another(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         amount = item["amount"]
         expiry = item["expiry"]
 
+        variety = item.get("variety", "")
+        label = f"{name} ({variety})" if variety else name
+
         if name not in unit_of:
             # Batch row was still logged; only the main-tab rollup is missing.
             summary_lines.append(
-                f"{name}: +{fmt_number(amount)} "
+                f"{label}: +{fmt_number(amount)} "
                 "(⚠️ not found in main tab, stock not tracked)"
             )
             continue
 
         unit = unit_of.get(name, "")
         current = current_of.get(name)
-        total_note = f", now {fmt_number(current)}{unit}" if current is not None else ""
+        total_note = (
+            f", now {fmt_qty(current, unit)}" if current is not None else ""
+        )
         expiry_note = (
             f", expires {expiry.strftime('%d/%m/%Y')}"
             if expiry is not None
             else ", no expiry date"
         )
         summary_lines.append(
-            f"{name}: +{fmt_number(amount)}{unit}{total_note}{expiry_note}"
+            f"{label}: +{fmt_qty(amount, unit)}{total_note}{expiry_note}"
         )
 
     context.user_data.clear()
@@ -814,10 +1148,11 @@ async def restock_another(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 def live_batches(records):
-    """Return [(row_number, ingredient, remaining, expiry_raw)] for live batches.
+    """Return [(row, ingredient, remaining, expiry_raw, variety)] for live batches.
 
-    A batch is "live" when its Remaining (column I, 0-based index 8 — a formula
-    on the restocks tab) is greater than 0. Row 1 is the header.
+    A batch is "live" when its Remaining (column J, 0-based index 9 — a formula
+    on the Restocks tab) is greater than 0. Row 1 is the header. Rows come back
+    in sheet order, which is the FIFO order the waterfall draws stock down in.
     """
     batches = []
     for i, record in enumerate(records, start=1):
@@ -826,17 +1161,23 @@ def live_batches(records):
         name = record[2].strip() if len(record) > 2 and record[2] else ""
         if not name:
             continue
-        remaining = parse_sheet_number(record[8] if len(record) > 8 else "")
+        remaining = parse_sheet_number(record[9] if len(record) > 9 else "")
         if remaining is None or remaining <= 0:
             continue
-        batches.append((i, name, remaining, record[4] if len(record) > 4 else ""))
+        batches.append((
+            i,
+            name,
+            remaining,
+            record[4] if len(record) > 4 else "",   # E Expiry Date
+            (record[6] or "").strip() if len(record) > 6 else "",  # G Variety
+        ))
     return batches
 
 
 def _discard_menu(batches) -> str:
     today = datetime.now(TIMEZONE).date()
     lines = ["🗑️ Discard — Select a batch to write off:", ""]
-    for n, (_row, name, remaining, expiry_raw) in enumerate(batches, start=1):
+    for n, (_row, name, remaining, expiry_raw, variety) in enumerate(batches, start=1):
         expiry_date = parse_expiry_date(expiry_raw)
         if expiry_date is None:
             note = "no expiry date"
@@ -844,7 +1185,9 @@ def _discard_menu(batches) -> str:
             note = f"⚠️ EXPIRED {expiry_date.strftime('%d/%m/%Y')}"
         else:
             note = f"expires {expiry_date.strftime('%d/%m/%Y')}"
-        lines.append(f"{n}. {name} — {fmt_number(remaining)} left, {note}")
+        label = f"{name} ({variety})" if variety else name
+        amount = fmt_qty(remaining, UNITS.get(name, ""))
+        lines.append(f"{n}. {label} — {amount} left, {note}")
     lines.append("")
     lines.append("Enter the number:")
     return "\n".join(lines)
@@ -896,13 +1239,14 @@ async def discard_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return DISCARD_SELECT
 
-    row_number, name, remaining, _expiry = batches[choice - 1]
+    row_number, name, remaining, _expiry, variety = batches[choice - 1]
     context.user_data["row_number"] = row_number
     context.user_data["name"] = name
     context.user_data["remaining"] = remaining
 
+    label = f"{name} ({variety})" if variety else name
     await update.message.reply_text(
-        f"{name} — {fmt_number(remaining)} left in this batch.\n"
+        f"{label} — {fmt_qty(remaining, UNITS.get(name, ''))} left in this batch.\n"
         'Enter the amount to write off, or type "all":'
     )
     return DISCARD_AMOUNT
@@ -926,15 +1270,15 @@ async def discard_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return DISCARD_AMOUNT
         if amount > remaining:
             await update.message.reply_text(
-                f"❌ Only {fmt_number(remaining)} left in this batch. "
+                f"❌ Only {fmt_qty(remaining, UNITS.get(name, ''))} left in this batch. "
                 'Enter a smaller amount, or type "all":'
             )
             return DISCARD_AMOUNT
 
-    # Written Off (column G) is cumulative — add to whatever is already there.
+    # Written Off (column H) is cumulative — add to whatever is already there.
     try:
-        existing = parse_sheet_number(restock_sheet.cell(row_number, 7).value) or 0.0
-        restock_sheet.update_cell(row_number, 7, existing + amount)
+        existing = parse_sheet_number(restock_sheet.cell(row_number, 8).value) or 0.0
+        restock_sheet.update_cell(row_number, 8, existing + amount)
     except Exception as exc:  # noqa: BLE001 - surface any API error to user
         await update.message.reply_text(
             f"⚠️ Failed to save the write-off to the sheet: {exc}\n"
@@ -944,8 +1288,8 @@ async def discard_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     context.user_data.clear()
     await update.message.reply_text(
-        f"🗑️ Wrote off {fmt_number(amount)} of {name}. "
-        f"{fmt_number(remaining - amount)} left in that batch."
+        f"🗑️ Wrote off {fmt_qty(amount, UNITS.get(name, ''))} of {name}. "
+        f"{fmt_qty(remaining - amount, UNITS.get(name, ''))} left in that batch."
     )
     return ConversationHandler.END
 
@@ -980,21 +1324,13 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # main tab: A Ingredient, B Unit, C Initial Stock, D Total Usage,
-    # E Current Stock, F Expiry Date, G Status. Data lives in rows 2-10.
-    lines = ["📦 Current Inventory", ""]
-    for record in records[1:10]:
-        ingredient = record[0] if len(record) > 0 else ""
-        if not ingredient:
-            continue
-        unit = record[1] if len(record) > 1 else ""
-        current_stock = record[4] if len(record) > 4 else ""
-        status_flag = record[6] if len(record) > 6 else ""
-        emoji = STATUS_EMOJI.get(status_flag.strip().upper(), "")
-        emoji_part = f" {emoji}" if emoji else ""
-        status_part = f" {status_flag}" if status_flag else ""
-        lines.append(f"{ingredient}: {current_stock}{unit}{emoji_part}{status_part}")
+    try:
+        restock_records = restock_sheet.get_all_values()
+    except Exception as exc:  # noqa: BLE001 - breakdown is a nicety, not essential
+        print(f"WARNING: /status could not read the ledger: {exc}", file=sys.stderr)
+        restock_records = []
 
+    lines = ["📦 Current Inventory", ""] + stock_lines(records, restock_records)
     await update.message.reply_text("\n".join(lines))
 
 
@@ -1088,6 +1424,13 @@ async def expiry_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         print(f"WARNING: expiry check failed to read sheet: {exc}", file=sys.stderr)
         return
 
+    # Used only to name the variety behind a varietal ingredient's expiry date.
+    try:
+        varieties = current_varieties(restock_sheet.get_all_values())
+    except Exception as exc:  # noqa: BLE001 - naming is a nicety, not essential
+        print(f"WARNING: expiry check could not read the ledger: {exc}", file=sys.stderr)
+        varieties = {}
+
     today = datetime.now(TIMEZONE).date()
     expired = []       # (name, date)
     expiring_soon = [] # (name, date, days)
@@ -1110,46 +1453,57 @@ async def expiry_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         days_left = (expiry_date - today).days
         if days_left < 0:
             expired.append((ingredient, expiry_date))
-        elif days_left <= 3:
+        elif days_left <= EXPIRY_WARNING_DAYS:
             expiring_soon.append((ingredient, expiry_date, days_left))
 
     if not expired and not expiring_soon:
         return  # nothing to report — don't spam an "all clear" message
 
+    def label(name):
+        """Name the variety behind the date, so 'V60' says which beans."""
+        variety = varieties.get(name)
+        return f"{name} ({variety})" if variety else name
+
     lines = [f"⚠️ Expiry Alert — {today.strftime('%d/%m/%Y')}", ""]
     if expired:
         lines.append("🔴 EXPIRED:")
         for name, d in expired:
-            lines.append(f"  {name} — expired {d.strftime('%d/%m/%Y')}")
+            lines.append(f"  {label(name)} — expired {d.strftime('%d/%m/%Y')}")
         lines.append("")
     if expiring_soon:
         lines.append("🟡 EXPIRING SOON:")
         for name, d, days_left in expiring_soon:
             word = "day" if days_left == 1 else "days"
             lines.append(
-                f"  {name} — expires {d.strftime('%d/%m/%Y')} ({days_left} {word})"
+                f"  {label(name)} — expires {d.strftime('%d/%m/%Y')} "
+                f"({days_left} {word})"
             )
 
     await broadcast_to_exco(context, "\n".join(lines).rstrip())
 
 
 async def weekly_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Monday 7AM SGT: send EXCO a usage summary for the previous week."""
-    today = datetime.now(TIMEZONE).date()
-    this_monday = today - timedelta(days=today.weekday())  # Monday of current week
-    last_monday = this_monday - timedelta(days=7)
-    last_sunday = this_monday - timedelta(days=1)
+    """Friday 9PM SGT: send EXCO the week's usage plus current stock levels.
 
-    range_str = (
-        f"{last_monday.strftime('%d/%m/%Y')} to {last_sunday.strftime('%d/%m/%Y')}"
-    )
+    The window is a rolling seven days ending today, so consecutive reports are
+    contiguous — every trading day appears in exactly one summary, with no gap
+    and no double-counting.
+    """
+    end = datetime.now(TIMEZONE).date()
+    start = end - timedelta(days=6)
+
+    range_str = f"{start.strftime('%d/%m/%Y')} to {end.strftime('%d/%m/%Y')}"
 
     try:
         records = sheet.get_all_values()
         main_records = main_sheet.get_all_values()
+        restock_records = restock_sheet.get_all_values()
     except Exception as exc:  # noqa: BLE001
         print(f"WARNING: weekly summary failed to read sheet: {exc}", file=sys.stderr)
         return
+
+    stock_section = "\n".join(["📦 Current Stock", ""] + stock_lines(
+        main_records, restock_records))
 
     # Units come from the main tab (A Ingredient, B Unit).
     unit_of = {}
@@ -1168,7 +1522,7 @@ async def weekly_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             row_date = datetime.strptime(str(date_cell).strip(), "%Y-%m-%d").date()
         except (ValueError, AttributeError):
             row_date = parse_expiry_date(date_cell)
-        if row_date is None or not (last_monday <= row_date <= last_sunday):
+        if row_date is None or not (start <= row_date <= end):
             continue
 
         row_has_usage = False
@@ -1186,21 +1540,22 @@ async def weekly_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if total_shifts == 0:
         text = (
             f"📊 Weekly Summary — {range_str}\n\n"
-            "No shift records found for this period."
+            "No shift records found for this period.\n\n"
+            f"{stock_section}"
         )
         await broadcast_to_exco(context, text)
         return
 
-    table = [f"{'Ingredient':<18}{'Used':<10}Shifts"]
+    table = [f"{'Ingredient':<18}{'Used':<12}Shifts"]
     for j, name in enumerate(INGREDIENTS):
-        unit = unit_of.get(name, "")
-        used = f"{fmt_number(totals[j])}{unit}"
-        table.append(f"{name:<18}{used:<10}{shift_counts[j]}")
+        used = fmt_qty(totals[j], unit_of.get(name, ""))
+        table.append(f"{name:<18}{used:<12}{shift_counts[j]}")
 
     text = (
         f"📊 Weekly Summary — {range_str}\n\n"
-        "```\n" + "\n".join(table) + "\n```\n\n"
-        f"Total shifts recorded: {total_shifts}"
+        "```\n" + "\n".join(table) + "\n```\n"
+        f"Total shifts recorded: {total_shifts}\n\n"
+        f"{stock_section}"
     )
     await broadcast_to_exco(context, text, parse_mode="Markdown")
 
@@ -1278,10 +1633,20 @@ def main() -> None:
         )
     print("----------------------")
 
-    application = Application.builder().token(token).build()
+    application = (
+        Application.builder()
+        .token(token)
+        .post_init(sync_all_command_menus)
+        .build()
+    )
 
     presale_conv = ConversationHandler(
-        entry_points=[CommandHandler("recordpresale", recordpresale)],
+        entry_points=[
+            CommandHandler("recordpresale", recordpresale),
+            # The keyboard button sends its label as plain text, so it needs a
+            # text entry point -- a command mid-string never reaches CommandHandler.
+            MessageHandler(filters.Text([BTN_PRESALE]), recordpresale),
+        ],
         states={
             WAITING_FOR_PRESALE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, presale_input)
@@ -1291,7 +1656,10 @@ def main() -> None:
     )
 
     postsale_conv = ConversationHandler(
-        entry_points=[CommandHandler("recordpostsale", recordpostsale)],
+        entry_points=[
+            CommandHandler("recordpostsale", recordpostsale),
+            MessageHandler(filters.Text([BTN_POSTSALE]), recordpostsale),
+        ],
         states={
             WAITING_FOR_POSTSALE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, postsale_input)
@@ -1305,6 +1673,9 @@ def main() -> None:
         states={
             RESTOCK_SELECT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, restock_select)
+            ],
+            RESTOCK_VARIETY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, restock_variety)
             ],
             RESTOCK_AMOUNT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, restock_amount)
@@ -1342,10 +1713,15 @@ def main() -> None:
     application.add_handler(CommandHandler("undo", undo))
 
     # Scheduled jobs (all times Asia/Singapore).
+    #
+    # NOTE: run_daily's `days` is 0-6 = SUNDAY-saturday, not Monday-first. PTB
+    # flipped this in v20.0; the previous `days=(0,)  # Monday` was silently
+    # running on Sundays. 5 = Friday.
     job_queue = application.job_queue
-    alert_time = time(hour=7, minute=0, second=0, tzinfo=TIMEZONE)
-    job_queue.run_daily(expiry_check_job, time=alert_time)
-    job_queue.run_daily(weekly_summary_job, time=alert_time, days=(0,))  # Monday
+    expiry_time = time(hour=7, minute=0, second=0, tzinfo=TIMEZONE)
+    summary_time = time(hour=21, minute=0, second=0, tzinfo=TIMEZONE)
+    job_queue.run_daily(expiry_check_job, time=expiry_time)
+    job_queue.run_daily(weekly_summary_job, time=summary_time, days=(5,))  # Friday
 
     print("Cafe Logistics bot is running. Press Ctrl+C to stop.")
     application.run_polling()
